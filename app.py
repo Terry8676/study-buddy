@@ -76,7 +76,7 @@ tab_plan, tab_quiz = st.tabs(["Study Plan", "Quiz"])
 
 # ---------------- Study plan ----------------
 with tab_plan:
-    topic = st.text_input("What are you studying?", key="plan_topic")
+    topic = st.text_area("What are you studying?", key="plan_topic", height=160)
     c1, c2, c3 = st.columns(3)
     days = c1.number_input("Days", 1, 30, 3)
     hours = c2.number_input("Hours/day", 0.5, 8.0, 1.0, step=0.5)
@@ -98,7 +98,7 @@ with tab_plan:
         st.markdown(st.session_state.plan_msgs[-1]["content"])
 
         # ---------- Pattern 3: ITERATIVE REFINEMENT ----------
-        tweak = st.text_input("Want changes? (e.g. 'make day 2 lighter')", key="tweak")
+        tweak = st.text_area("Want changes? (e.g. 'make day 2 lighter')", key="tweak", height=100)
         if st.button("Refine plan") and tweak:
             st.session_state.plan_msgs.append({"role": "user", "content": tweak})
             with st.spinner("Revising..."):
@@ -108,7 +108,7 @@ with tab_plan:
 
 # ---------------- Quiz ----------------
 with tab_quiz:
-    qtopic = st.text_input("Quiz topic", key="quiz_topic")
+    qtopic = st.text_area("Quiz topic", key="quiz_topic", height=140)
     n = st.slider("Number of questions", 3, 10, 5)
 
     if st.button("Make quiz") and qtopic:
