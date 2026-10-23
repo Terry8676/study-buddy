@@ -26,3 +26,6 @@ then quizzes them on it.
 
 ## Tech
 Python, Streamlit, Groq API
+
+## Web URL
+https://terry8676-study-buddy-app-8dkxpw.streamlit.app/
