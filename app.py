@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 import streamlit as st
 from groq import Groq
@@ -20,6 +21,8 @@ def get_client():
 
 client = get_client()
 
+# Order matters: the first one available is used.
+# For the fastest quiz, move "llama-3.1-8b-instant" to the front.
 CANDIDATES = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.1-8b-instant"]
 
 
@@ -57,31 +60,42 @@ QUIZ_FORMAT = (
     'Respond with ONLY valid JSON, no extra text, in this shape: '
     '{"questions": [{"question": "...", "options": ["A", "B", "C", "D"], '
     '"answer_index": 0, "explanation": "..."}]}. '
-    "Rules: exactly 4 options per question, exactly one correct answer, "
+    "Rules: the questions array must contain EXACTLY the number of questions requested, "
+    "exactly 4 options per question, exactly one correct answer, "
     "and plausible wrong options. "
     "Never use double quotes inside question, option, or explanation text; "
     "use single quotes instead. "
     "Before responding, check that answer_index points to the correct option."
 )
-QUIZ_EXAMPLE_OUT = json.dumps({"questions": [{
-    "question": "Where do the light reactions occur?",
-    "options": ["Stroma", "Thylakoid membrane", "Nucleus", "Mitochondria"],
-    "answer_index": 1,
-    "explanation": "Light reactions happen in the thylakoid membranes of the chloroplast."
-}]})
+QUIZ_EXAMPLE_OUT = json.dumps({"questions": [
+    {
+        "question": "Where do the light reactions occur?",
+        "options": ["Stroma", "Thylakoid membrane", "Nucleus", "Mitochondria"],
+        "answer_index": 1,
+        "explanation": "Light reactions happen in the thylakoid membranes of the chloroplast."
+    },
+    {
+        "question": "Which molecule is produced by the Calvin cycle?",
+        "options": ["Oxygen", "Glucose precursor (G3P)", "ATP", "Water"],
+        "answer_index": 1,
+        "explanation": "The Calvin cycle uses ATP and NADPH to build G3P, which becomes glucose."
+    },
+]})
 
 
 def ask(messages, temperature=0.5, json_mode=False):
     kwargs = {"model": MODEL, "messages": messages, "temperature": temperature}
+    if MODEL.startswith("openai/gpt-oss"):
+        kwargs["reasoning_effort"] = "low"          # less hidden thinking = faster
     if json_mode:
-        try:
-            resp = client.chat.completions.create(
-                response_format={"type": "json_object"}, **kwargs
-            )
-            return resp.choices[0].message.content
-        except Exception:
-            pass  # model doesn't support JSON mode, fall back below
-    resp = client.chat.completions.create(**kwargs)
+        kwargs["response_format"] = {"type": "json_object"}
+    try:
+        resp = client.chat.completions.create(**kwargs)
+    except Exception:
+        # the model may not support these options, so retry plainly
+        kwargs.pop("reasoning_effort", None)
+        kwargs.pop("response_format", None)
+        resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content
 
 
@@ -92,8 +106,8 @@ def clean_input(text):
     return text.replace("\u2018", "'").replace("\u2019", "'")
 
 
-def parse_quiz(raw):
-    """Pull the JSON object out of the reply and validate its structure."""
+def parse_quiz(raw, n):
+    """Pull the JSON object out of the reply, validate it, and enforce the count."""
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1:
         raise ValueError("no JSON found")
@@ -101,7 +115,9 @@ def parse_quiz(raw):
     for q in questions:
         if len(q["options"]) < 2 or not (0 <= q["answer_index"] < len(q["options"])):
             raise ValueError("bad question structure")
-    return questions
+    if len(questions) < n:
+        raise ValueError("too few questions")
+    return questions[:n]                              # trim extras
 
 
 def repair_json(raw):
@@ -115,6 +131,7 @@ def repair_json(raw):
 
 
 st.title("📚 Study Buddy")
+st.caption(f"Model: {MODEL}")
 tab_plan, tab_quiz = st.tabs(["Study Plan", "Quiz"])
 
 # ---------------- Study plan ----------------
@@ -157,32 +174,36 @@ with tab_quiz:
     if st.button("Make quiz") and qtopic:
         msgs = [
             {"role": "system", "content": PERSONA + " " + QUIZ_FORMAT},
-            {"role": "user", "content": "Topic: Photosynthesis. Make 1 question."},
+            {"role": "user", "content": "Topic: Photosynthesis. Make exactly 2 questions."},
             {"role": "assistant", "content": QUIZ_EXAMPLE_OUT},
-            {"role": "user", "content": f"Topic: {clean_input(qtopic)}. Make {n} questions."},
+            {"role": "user", "content": f"Topic: {clean_input(qtopic)}. Make exactly {n} questions."},
         ]
         quiz, raw = None, ""
-        with st.spinner("Writing questions..."):
-            for attempt in range(3):                  # up to 3 tries
+        t0 = time.time()
+        with st.spinner(f"Writing {n} questions..."):
+            for attempt in range(2):                  # up to 2 tries
                 raw = ask(msgs, temperature=0.3, json_mode=True)
                 try:
-                    quiz = parse_quiz(raw)
+                    quiz = parse_quiz(raw, n)
                     break
-                except (ValueError, KeyError, TypeError):
-                    try:                              # one repair attempt
+                except json.JSONDecodeError:          # broken JSON: try one repair
+                    try:
                         raw = repair_json(raw)
-                        quiz = parse_quiz(raw)
+                        quiz = parse_quiz(raw, n)
                         break
                     except (ValueError, KeyError, TypeError):
                         continue
+                except (ValueError, KeyError, TypeError):   # wrong count or structure
+                    continue
         if quiz:
             # clear old radio selections so a new quiz starts blank
             for k in list(st.session_state.keys()):
                 if k.startswith("q") and k[1:].isdigit():
                     del st.session_state[k]
             st.session_state.quiz = quiz
+            st.caption(f"Generated {len(quiz)} questions in {time.time() - t0:.1f}s")
         else:
-            st.error("The model returned bad JSON 3 times. Try fewer questions or simpler wording.")
+            st.error("Couldn't build a valid quiz. Try fewer questions or simpler wording.")
             with st.expander("Raw model output (for debugging)"):
                 st.code(raw)
 
