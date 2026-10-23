@@ -4,6 +4,7 @@ import os
 import streamlit as st
 from groq import Groq
 
+
 def get_client():
     key = os.environ.get("GROQ_API_KEY")
     if not key:
@@ -15,6 +16,7 @@ def get_client():
         st.error("GROQ_API_KEY is not set.")
         st.stop()
     return Groq(api_key=key)
+
 
 client = get_client()
 
@@ -54,7 +56,12 @@ PLAN_EXAMPLE_OUT = """**Day 1 (1h)**
 QUIZ_FORMAT = (
     'Respond with ONLY valid JSON, no extra text, in this shape: '
     '{"questions": [{"question": "...", "options": ["A", "B", "C", "D"], '
-    '"answer_index": 0, "explanation": "..."}]}'
+    '"answer_index": 0, "explanation": "..."}]}. '
+    "Rules: exactly 4 options per question, exactly one correct answer, "
+    "and plausible wrong options. "
+    "Never use double quotes inside question, option, or explanation text; "
+    "use single quotes instead. "
+    "Before responding, check that answer_index points to the correct option."
 )
 QUIZ_EXAMPLE_OUT = json.dumps({"questions": [{
     "question": "Where do the light reactions occur?",
@@ -64,11 +71,47 @@ QUIZ_EXAMPLE_OUT = json.dumps({"questions": [{
 }]})
 
 
-def ask(messages, temperature=0.5):
-    resp = client.chat.completions.create(
-        model=MODEL, messages=messages, temperature=temperature
-    )
+def ask(messages, temperature=0.5, json_mode=False):
+    kwargs = {"model": MODEL, "messages": messages, "temperature": temperature}
+    if json_mode:
+        try:
+            resp = client.chat.completions.create(
+                response_format={"type": "json_object"}, **kwargs
+            )
+            return resp.choices[0].message.content
+        except Exception:
+            pass  # model doesn't support JSON mode, fall back below
+    resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content
+
+
+def clean_input(text):
+    """Swap double and curly quotes for single quotes before sending to the model."""
+    for ch in ['"', "\u201c", "\u201d"]:
+        text = text.replace(ch, "'")
+    return text.replace("\u2018", "'").replace("\u2019", "'")
+
+
+def parse_quiz(raw):
+    """Pull the JSON object out of the reply and validate its structure."""
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("no JSON found")
+    questions = json.loads(raw[start:end + 1], strict=False)["questions"]
+    for q in questions:
+        if len(q["options"]) < 2 or not (0 <= q["answer_index"] < len(q["options"])):
+            raise ValueError("bad question structure")
+    return questions
+
+
+def repair_json(raw):
+    """Last resort: ask the model to fix its own broken JSON."""
+    fix = [
+        {"role": "system", "content": "You fix broken JSON. Output ONLY the corrected JSON object. "
+                                      "Replace any double quotes inside string values with single quotes."},
+        {"role": "user", "content": raw},
+    ]
+    return ask(fix, temperature=0, json_mode=True)
 
 
 st.title("📚 Study Buddy")
@@ -116,16 +159,32 @@ with tab_quiz:
             {"role": "system", "content": PERSONA + " " + QUIZ_FORMAT},
             {"role": "user", "content": "Topic: Photosynthesis. Make 1 question."},
             {"role": "assistant", "content": QUIZ_EXAMPLE_OUT},
-            {"role": "user", "content": f"Topic: {qtopic}. Make {n} questions."},
+            {"role": "user", "content": f"Topic: {clean_input(qtopic)}. Make {n} questions."},
         ]
+        quiz, raw = None, ""
         with st.spinner("Writing questions..."):
-            raw = ask(msgs, temperature=0.4)
-        try:
-            raw = raw.strip().removeprefix("```json").removesuffix("```").strip()
-            st.session_state.quiz = json.loads(raw)["questions"]
-            st.session_state.checked = False
-        except (json.JSONDecodeError, KeyError):
-            st.error("The model returned bad JSON. Click 'Make quiz' again.")
+            for attempt in range(3):                  # up to 3 tries
+                raw = ask(msgs, temperature=0.3, json_mode=True)
+                try:
+                    quiz = parse_quiz(raw)
+                    break
+                except (ValueError, KeyError, TypeError):
+                    try:                              # one repair attempt
+                        raw = repair_json(raw)
+                        quiz = parse_quiz(raw)
+                        break
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        if quiz:
+            # clear old radio selections so a new quiz starts blank
+            for k in list(st.session_state.keys()):
+                if k.startswith("q") and k[1:].isdigit():
+                    del st.session_state[k]
+            st.session_state.quiz = quiz
+        else:
+            st.error("The model returned bad JSON 3 times. Try fewer questions or simpler wording.")
+            with st.expander("Raw model output (for debugging)"):
+                st.code(raw)
 
     if "quiz" in st.session_state:
         answers = {}
